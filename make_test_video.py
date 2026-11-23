@@ -29,7 +29,7 @@ def parse_args():
     p.add_argument("--truth", default="synthetic_truth.csv")
     p.add_argument("--size", default="1280x720")
     p.add_argument("--fps", type=float, default=50)
-    p.add_argument("--length", type=float, default=420, help="pivot to bob distance in pixels")
+    p.add_argument("--length", type=float, help="pivot to bob distance in pixels (default: 58%% of height)")
     p.add_argument("--roll", type=float, default=2.0, help="camera tilt in degrees")
     p.add_argument("--noise", type=float, default=4.0, help="sensor noise (grey levels)")
     p.add_argument("--seed", type=int, default=1)
@@ -96,30 +96,62 @@ def render(bg, pivot, length, angle_deg, roll_deg):
     return img
 
 
+def open_writer(path, fps, size):
+    """Open a video writer, trying codecs that are usually available. Never fail silently."""
+    stem = path.rsplit(".", 1)[0]
+    for out_path, codec in ((path, "mp4v"), (path, "avc1"), (stem + ".avi", "MJPG"), (stem + ".avi", "XVID")):
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*codec), fps, size)
+        if writer.isOpened():
+            print(f"Writing {out_path} with codec {codec}")
+            return writer, out_path
+    raise SystemExit("OpenCV could not open any video writer. Check the 'Video I/O' section of\n"
+                     "  python3 -c \"import cv2; print(cv2.getBuildInformation())\"")
+
+
 def make_video(args):
     w, h = (int(v) for v in args.size.lower().split("x"))
+    length = args.length or 0.58 * h
     rng = np.random.default_rng(args.seed)
+    cv2.setRNGSeed(args.seed)
     angles, labels = true_angle_schedule(args.fps, rng)
     bg = background(w, h, rng)
-    pivot = (w / 2, 100.0)
+    pivot = (w / 2, 0.14 * h)
 
-    out = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h))
+    out, out_path = open_writer(args.out, args.fps, (w, h))
     sub = 4  # motion blur: average 4 renders spread over half a frame period
+    acc = np.empty((h, w, 3), np.float32)
+    noise = np.empty((h, w, 3), np.float32)
+    n = len(angles)
     with open(args.truth, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["t_s", "true_deg", "part", "roll_deg"])
         for i, angle in enumerate(angles):
-            nxt = angles[min(i + 1, len(angles) - 1)]
-            acc = np.zeros((h, w, 3), np.float32)
+            nxt = angles[min(i + 1, n - 1)]
+            acc[:] = 0
             for k in range(sub):
-                acc += render(bg, pivot, args.length, angle + (nxt - angle) * 0.5 * k / sub, args.roll)
-            frame = acc / sub + rng.normal(0, args.noise, (h, w, 3))
-            out.write(frame.clip(0, 255).astype(np.uint8))
+                acc += render(bg, pivot, length, angle + (nxt - angle) * 0.5 * k / sub, args.roll)
+            cv2.randn(noise, (0, 0, 0), (args.noise,) * 3)
+            out.write(cv2.convertScaleAbs(cv2.scaleAdd(acc, 1.0 / sub, noise)))
             # the true angle is the mean over the exposure
             true = angle + (nxt - angle) * 0.5 * (sub - 1) / (2 * sub)
             writer.writerow([f"{i / args.fps:.4f}", f"{true:.4f}", labels[i], args.roll])
-    out.release()
-    print(f"Wrote {args.out} ({len(angles)} frames, {len(angles) / args.fps:.0f} s) and {args.truth}")
+            if i % 50 == 0 or i == n - 1:
+                f.flush()
+                print(f"\r  frame {i + 1}/{n}", end="", flush=True)
+    out.release()  # the video file is only playable after this line
+    print()
+
+    # Read the file back, so an empty or broken video is reported here and not later.
+    check = cv2.VideoCapture(out_path)
+    readable = 0
+    while check.read()[0]:
+        readable += 1
+    check.release()
+    if readable == 0:
+        raise SystemExit(f"{out_path} was written but OpenCV cannot read it back. Try --out test.avi")
+    print(f"Done: {out_path} ({readable} frames, {n / args.fps:.0f} s) and {args.truth}")
+    if out_path != args.out:
+        print(f"Note: use --video {out_path} with the tracker.")
 
 
 def compare(args):

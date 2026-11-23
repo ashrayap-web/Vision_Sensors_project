@@ -116,6 +116,7 @@ class VideoSource:
         if not self.cap.isOpened():
             raise SystemExit(f"Cannot open video {path}")
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        print(f"Video {path}: {int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))} frames at {self.fps:g} fps")
         self.count = 0
 
     def read(self):
@@ -320,6 +321,8 @@ def main():
         if args.tune:
             print(f"--hsv-low {lo[0]},{lo[1]},{lo[2]} --hsv-high {hi[0]},{hi[1]},{hi[2]}")
         print(f"{frames} frames, markers missed in {missed}")
+        if frames == 0:
+            print("No frames were read. If this was a video file, check that it plays and is not empty.")
 
 
 if __name__ == "__main__":
