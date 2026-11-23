@@ -2,9 +2,12 @@
 """
 Pendulum angle tracker for the Raspberry Pi HQ Camera (Picamera2 + OpenCV).
 
-Put two markers of the same bright colour on the pendulum: one on the pivot and one on the
-bob (or near the end of the arm). The script finds both markers in every frame and reports the
-angle of the line between them, measured from the vertical:
+Two ways to find the pendulum:
+  colour markers (default)  two dots of the same bright colour, one on the pivot, one on the bob
+  printed tags (--aruco)    two ArUco or AprilTag tags: id 0 centred on the pivot axle, id 1 on
+                            the arm, both mounted with their top edge towards the pivot
+The script finds both in every frame and reports the angle of the line between them, measured
+from the vertical:
 
     angle = 0    pendulum hanging straight down (after zeroing with the wind off)
     angle > 0    bob to the right of the pivot in the image
@@ -17,6 +20,11 @@ Usage
     python pendulum_tracker.py --csv run1.csv           log every frame to a CSV file
     python pendulum_tracker.py --auto-zero 2            use the mean of the first 2 s as zero
     python pendulum_tracker.py --speed-k 9.0            also show v = k * sqrt(tan(angle))
+    python pendulum_tracker.py --aruco                  track printed ArUco 4x4 tags instead of colour
+    python pendulum_tracker.py --aruco --aruco-dict APRILTAG_36h11    AprilTag tags instead
+
+With tags: if both tags are seen, the angle comes from the line between their centres (most
+accurate). If only one is seen, it comes from that tag's own rotation, so mount the tags straight.
 
 Keys in the video window
     z   set zero to the current averaged angle (do this with the wind OFF)
@@ -58,6 +66,11 @@ def parse_args():
     p.add_argument("--speed-k", type=float, help="calibration constant k in v = k*sqrt(tan(angle))")
     p.add_argument("--csv", help="write time and angles for every frame to this CSV file")
     p.add_argument("--tune", action="store_true", help="show sliders and the mask to tune the colour")
+    p.add_argument("--aruco", action="store_true", help="track printed ArUco/AprilTag tags instead of colour")
+    p.add_argument("--aruco-dict", default="4X4_50",
+                   help="tag family: 4X4_50 (default), APRILTAG_36h11, 5X5_50, ...")
+    p.add_argument("--pivot-id", type=int, default=0, help="id of the tag on the pivot (default 0)")
+    p.add_argument("--arm-id", type=int, default=1, help="id of the tag on the arm (default 1)")
     p.add_argument("--no-display", action="store_true", help="no windows (for batch runs on videos)")
     return p.parse_args()
 
@@ -170,6 +183,62 @@ def angle_from_vertical(pivot, bob):
     return math.degrees(math.atan2(dx, dy))
 
 
+
+def make_tag_detector(dict_name):
+    """Return a function gray_image -> (corners, ids). Works with old and new OpenCV versions."""
+    aruco = getattr(cv2, "aruco", None)
+    if aruco is None:
+        raise SystemExit("This OpenCV has no ArUco module. On the Pi: sudo apt install python3-opencv. "
+                         "With pip: pip install opencv-contrib-python")
+    dict_id = getattr(aruco, "DICT_" + dict_name.upper(), None)
+    if dict_id is None:
+        raise SystemExit(f"Unknown tag family {dict_name}. Examples: 4X4_50, 5X5_100, APRILTAG_36h11")
+    if hasattr(aruco, "ArucoDetector"):                       # OpenCV 4.7 and newer
+        params = aruco.DetectorParameters()
+        params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+        detector = aruco.ArucoDetector(aruco.getPredefinedDictionary(dict_id), params)
+        return lambda gray: detector.detectMarkers(gray)[:2]
+    dictionary = aruco.Dictionary_get(dict_id)                # OpenCV 4.6 and older
+    params = aruco.DetectorParameters_create()
+    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    return lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params)[:2]
+
+
+def tag_centre(c):
+    """Centre of a tag = where its diagonals cross (correct even if the tag is seen at an angle)."""
+    p0, p1, p2, p3 = c
+    d1, d2 = p2 - p0, p3 - p1
+    denom = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(denom) < 1e-9:
+        return c.mean(axis=0)
+    t = ((p1[0] - p0[0]) * d2[1] - (p1[1] - p0[1]) * d2[0]) / denom
+    return p0 + t * d1
+
+
+def tag_down(c):
+    """Unit vector from the tag's top edge to its bottom edge (corners: TL, TR, BR, BL)."""
+    v = (c[2] + c[3]) / 2 - (c[0] + c[1]) / 2
+    return v / (np.linalg.norm(v) + 1e-9)
+
+
+def pick_from_tags(corners, ids, pivot_id, arm_id, fixed_pivot):
+    """Return (pivot, point_on_arm, source). source says how the angle was found."""
+    found = {}
+    if ids is not None:
+        for c, i in zip(corners, ids.flatten()):
+            found[int(i)] = c.reshape(4, 2).astype(np.float64)
+    if arm_id in found and (pivot_id in found or fixed_pivot is not None):
+        pivot = tag_centre(found[pivot_id]) if pivot_id in found else np.array(fixed_pivot)
+        return pivot, tag_centre(found[arm_id]), "tags" if pivot_id in found else "fixed pivot"
+    for i in (arm_id, pivot_id):                              # only one tag: use its own rotation
+        if i in found:
+            c = found[i]
+            centre = tag_centre(c)
+            size = np.linalg.norm(c[1] - c[0])
+            return centre, centre + 2 * size * tag_down(c), f"tag {i} rotation"
+    return None, None, "none"
+
+
 # ----------------------------------------------------------------------------- helpers
 
 class RollingStats:
@@ -235,6 +304,10 @@ def main():
         w, h = (int(v) for v in args.size.lower().split("x"))
         source = CameraSource((w, h), args.fps, args.exposure_us)
 
+    detect_tags = make_tag_detector(args.aruco_dict) if args.aruco else None
+    if args.aruco:
+        args.tune = False
+
     if args.tune and display:
         make_tuner(lo, hi)
 
@@ -242,7 +315,7 @@ def main():
     if args.csv:
         csv_file = open(args.csv, "w", newline="")
         writer = csv.writer(csv_file)
-        writer.writerow(["t_s", "raw_deg", "angle_deg", "mean_deg", "std_deg", "found"])
+        writer.writerow(["t_s", "raw_deg", "angle_deg", "mean_deg", "std_deg", "found", "source"])
 
     zero = args.zero
     zero_samples = [] if args.auto_zero else None
@@ -262,8 +335,14 @@ def main():
             if args.tune and display:
                 lo, hi = read_tuner()
 
-            mask = colour_mask(frame, lo, hi)
-            pivot, bob = pick_pivot_and_bob(find_blobs(mask, args.min_area), fixed_pivot)
+            corners = ids = None
+            if detect_tags:
+                corners, ids = detect_tags(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                pivot, bob, how = pick_from_tags(corners, ids, args.pivot_id, args.arm_id, fixed_pivot)
+            else:
+                mask = colour_mask(frame, lo, hi)
+                pivot, bob = pick_pivot_and_bob(find_blobs(mask, args.min_area), fixed_pivot)
+                how = "colour" if pivot is not None else "none"
 
             raw = float("nan")
             if pivot is not None:
@@ -284,20 +363,22 @@ def main():
 
             if writer:
                 writer.writerow([f"{t:.4f}", f"{raw:.3f}", f"{angle:.3f}", f"{mean:.3f}", f"{std:.3f}",
-                                 int(pivot is not None)])
+                                 int(pivot is not None), how])
 
             now = time.time()
             fps_est = 0.9 * fps_est + 0.1 / max(now - last_tick, 1e-6)
             last_tick = now
 
             if display:
-                lines = [f"angle {angle:+6.2f} deg" if pivot is not None else "markers not found",
+                lines = [f"angle {angle:+6.2f} deg ({how})" if pivot is not None else "markers not found",
                          f"mean {mean:+6.2f} +/- {std:.2f} deg ({args.window:g} s)",
                          f"zero {zero:+.2f} deg   {fps_est:4.1f} fps"]
                 if args.speed_k and not math.isnan(mean):
                     v = args.speed_k * math.sqrt(max(math.tan(math.radians(abs(mean))), 0.0))
                     lines.append(f"speed ~ {v:.2f} m/s")
                 view = frame.copy()
+                if ids is not None and len(ids):
+                    cv2.aruco.drawDetectedMarkers(view, corners, ids)
                 draw(view, pivot, bob, zero, lines)
                 cv2.imshow("pendulum", view)
                 if args.tune:
