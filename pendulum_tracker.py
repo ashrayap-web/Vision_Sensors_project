@@ -19,15 +19,20 @@ Usage
     python pendulum_tracker.py --pivot 640,120          fixed pivot pixel, track only the bob marker
     python pendulum_tracker.py --csv run1.csv           log every frame to a CSV file
     python pendulum_tracker.py --auto-zero 2            use the mean of the first 2 s as zero
+    python pendulum_tracker.py --aruco --debug          show why detection is failing
+    python pendulum_tracker.py --aruco --pivot-id 2 --arm-id 3 --exposure-us 1500   your 2 cm tags
     python pendulum_tracker.py --speed-k 9.0            also show v = k * sqrt(tan(angle))
     python pendulum_tracker.py --aruco                  track printed ArUco 4x4 tags instead of colour
     python pendulum_tracker.py --aruco --aruco-dict APRILTAG_36h11    AprilTag tags instead
 
-With tags: if both tags are seen, the angle comes from the line between their centres (most
-accurate). If only one is seen, it comes from that tag's own rotation, so mount the tags straight.
+With tags, the angle comes from the line between the two tag centres. If the arm tag is lost
+(usually motion blur: use a shorter --exposure-us), that frame is skipped, unless the pivot tag
+turns with the arm (--pivot-rotates): then its own rotation stands in for a few frames.
+Readings that jump faster than a pendulum can move (--max-rate) are thrown away.
 
 Keys in the video window
     z   set zero to the current averaged angle (do this with the wind OFF)
+    e   measure exposure and white balance again (after the lighting or the scene changes)
     s   save a snapshot (PNG)
     q   quit (in --tune mode, also prints the chosen HSV range)
 
@@ -71,7 +76,14 @@ def parse_args():
                    help="tag family: 4X4_50 (default), APRILTAG_36h11, 5X5_50, ...")
     p.add_argument("--pivot-id", type=int, default=0, help="id of the tag on the pivot (default 0)")
     p.add_argument("--arm-id", type=int, default=1, help="id of the tag on the arm (default 1)")
+    p.add_argument("--pivot-rotates", action="store_true",
+                   help="the pivot tag is fixed to the arm and turns with it, so its rotation can "
+                        "stand in when the arm tag is lost (not for a tag fixed to the stand)")
+    p.add_argument("--max-rate", type=float, default=600.0,
+                   help="fastest believable change in angle, deg/s; bigger jumps are rejected (default 600)")
     p.add_argument("--no-display", action="store_true", help="no windows (for batch runs on videos)")
+    p.add_argument("--debug", action="store_true",
+                   help="show image brightness, the colour mask, and tag candidates that failed to decode")
     return p.parse_args()
 
 
@@ -94,21 +106,30 @@ class CameraSource:
         )
         self.cam.configure(config)
         self.cam.start()
+        self.exposure_us = exposure_us
         time.sleep(1.5)  # let auto exposure and auto white balance settle
+        self.lock()
 
-        # Lock exposure, gain and white balance. If they keep changing, the colours change and the
-        # HSV thresholds stop working (and the windows of a wind tunnel change the light a lot).
+    def lock(self):
+        """Lock exposure, gain and white balance at what auto mode chose for the current scene.
+        If they keep changing, the colours change and detection stops working. Point the camera at
+        the real scene BEFORE starting, or press e later to measure again."""
         md = self.cam.capture_metadata()
         exposure, gain = md["ExposureTime"], md["AnalogueGain"]
-        if exposure_us:  # keep the same brightness: shorter exposure, more gain
-            gain = float(np.clip(gain * exposure / exposure_us, 1.0, 16.0))
-            exposure = exposure_us
+        if self.exposure_us:  # keep the same brightness: shorter exposure, more gain
+            gain = float(np.clip(gain * exposure / self.exposure_us, 1.0, 16.0))
+            exposure = self.exposure_us
         self.cam.set_controls({
             "AeEnable": False, "AwbEnable": False,
             "ExposureTime": int(exposure), "AnalogueGain": gain,
             "ColourGains": md["ColourGains"],
         })
         print(f"Camera locked: exposure {exposure} us, gain {gain:.2f}, colour gains {md['ColourGains']}")
+
+    def relock(self):
+        self.cam.set_controls({"AeEnable": True, "AwbEnable": True})
+        time.sleep(1.5)
+        self.lock()
 
     def read(self):
         request = self.cam.capture_request()
@@ -185,7 +206,7 @@ def angle_from_vertical(pivot, bob):
 
 
 def make_tag_detector(dict_name):
-    """Return a function gray_image -> (corners, ids). Works with old and new OpenCV versions."""
+    """Return a function gray_image -> (corners, ids, rejected). Works with old and new OpenCV."""
     aruco = getattr(cv2, "aruco", None)
     if aruco is None:
         raise SystemExit("This OpenCV has no ArUco module. On the Pi: sudo apt install python3-opencv. "
@@ -197,11 +218,11 @@ def make_tag_detector(dict_name):
         params = aruco.DetectorParameters()
         params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
         detector = aruco.ArucoDetector(aruco.getPredefinedDictionary(dict_id), params)
-        return lambda gray: detector.detectMarkers(gray)[:2]
+        return lambda gray: detector.detectMarkers(gray)
     dictionary = aruco.Dictionary_get(dict_id)                # OpenCV 4.6 and older
     params = aruco.DetectorParameters_create()
     params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-    return lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params)[:2]
+    return lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params)
 
 
 def tag_centre(c):
@@ -221,22 +242,45 @@ def tag_down(c):
     return v / (np.linalg.norm(v) + 1e-9)
 
 
-def pick_from_tags(corners, ids, pivot_id, arm_id, fixed_pivot):
-    """Return (pivot, point_on_arm, source). source says how the angle was found."""
+def wrap(deg):
+    """Wrap an angle to the range -180..180 degrees."""
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def tag_rotation(c):
+    """The tag's own rotation: angle of its top-to-bottom direction from vertical, degrees."""
+    d = tag_down(c)
+    return math.degrees(math.atan2(d[0], d[1]))
+
+
+def read_tags(corners, ids):
     found = {}
     if ids is not None:
         for c, i in zip(corners, ids.flatten()):
             found[int(i)] = c.reshape(4, 2).astype(np.float64)
-    if arm_id in found and (pivot_id in found or fixed_pivot is not None):
-        pivot = tag_centre(found[pivot_id]) if pivot_id in found else np.array(fixed_pivot)
-        return pivot, tag_centre(found[arm_id]), "tags" if pivot_id in found else "fixed pivot"
-    for i in (arm_id, pivot_id):                              # only one tag: use its own rotation
-        if i in found:
-            c = found[i]
-            centre = tag_centre(c)
-            size = np.linalg.norm(c[1] - c[0])
-            return centre, centre + 2 * size * tag_down(c), f"tag {i} rotation"
-    return None, None, "none"
+    return found
+
+
+class RotationFallback:
+    """While both tags are visible, learn how a tag's own rotation relates to the arm angle.
+    Then, when the other tag is lost, that tag's rotation can stand in. The fallback switches
+    itself off if the relation is not steady (a tag that does not really turn with the arm)."""
+
+    def __init__(self, min_samples=25, max_spread_deg=3.0):
+        self.diffs = {}
+        self.min_samples, self.max_spread = min_samples, max_spread_deg
+
+    def learn(self, tag_id, arm_angle, rotation):
+        self.diffs.setdefault(tag_id, deque(maxlen=200)).append(math.radians(arm_angle - rotation))
+
+    def offset(self, tag_id):
+        d = self.diffs.get(tag_id)
+        if not d or len(d) < self.min_samples:
+            return None
+        a = np.array(d)
+        s, c = np.sin(a).mean(), np.cos(a).mean()             # circular mean, safe near +/-180
+        spread = math.degrees(math.sqrt(max(0.0, -2.0 * math.log(max(math.hypot(s, c), 1e-12)))))
+        return math.degrees(math.atan2(s, c)) if spread <= self.max_spread else None
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -319,6 +363,9 @@ def main():
 
     zero = args.zero
     zero_samples = [] if args.auto_zero else None
+    fallback = RotationFallback()
+    rotation_ids = [args.arm_id] + ([args.pivot_id] if args.pivot_rotates else [])
+    last_good, jump_run, jumps, fallbacks = None, 0, 0, 0
     raw_stats = RollingStats(args.window)  # averaging is done on the raw angle; zero is subtracted after
     t0, last_tick, fps_est, frames, missed = None, time.time(), 0.0, 0, 0
 
@@ -335,18 +382,51 @@ def main():
             if args.tune and display:
                 lo, hi = read_tuner()
 
-            corners = ids = None
+            corners = ids = rejected = mask = None
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            measured, how, pivot, bob = float("nan"), "none", None, None
             if detect_tags:
-                corners, ids = detect_tags(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-                pivot, bob, how = pick_from_tags(corners, ids, args.pivot_id, args.arm_id, fixed_pivot)
+                corners, ids, rejected = detect_tags(gray)
+                found = read_tags(corners, ids)
+                if args.arm_id in found and (args.pivot_id in found or fixed_pivot is not None):
+                    pivot = tag_centre(found[args.pivot_id]) if args.pivot_id in found else np.array(fixed_pivot)
+                    bob = tag_centre(found[args.arm_id])
+                    measured = angle_from_vertical(pivot, bob)
+                    how = "tags" if args.pivot_id in found else "fixed pivot"
+                    for tid in rotation_ids:
+                        if tid in found:
+                            fallback.learn(tid, measured, tag_rotation(found[tid]))
+                else:
+                    for tid in rotation_ids:
+                        offset = fallback.offset(tid) if tid in found else None
+                        if offset is not None:
+                            c = found[tid]
+                            measured = wrap(tag_rotation(c) + offset)
+                            pivot = tag_centre(c)
+                            r = math.radians(measured)
+                            bob = pivot + 4 * np.linalg.norm(c[1] - c[0]) * np.array([math.sin(r), math.cos(r)])
+                            how = f"tag {tid} rotation"
+                            fallbacks += 1
+                            break
             else:
                 mask = colour_mask(frame, lo, hi)
                 pivot, bob = pick_pivot_and_bob(find_blobs(mask, args.min_area), fixed_pivot)
-                how = "colour" if pivot is not None else "none"
+                if pivot is not None:
+                    measured, how = angle_from_vertical(pivot, bob), "colour"
 
+            # Throw away readings that jump faster than the pendulum can move. After 5 rejections
+            # in a row the new value is accepted, so the tracker cannot get stuck.
             raw = float("nan")
-            if pivot is not None:
-                raw = angle_from_vertical(pivot, bob)
+            if not math.isnan(measured):
+                if last_good is not None and jump_run < 5 and \
+                        abs(wrap(measured - last_good[1])) > args.max_rate * (t - last_good[0]) + 3.0:
+                    jump_run += 1
+                    jumps += 1
+                    how += ", rejected jump"
+                else:
+                    raw, last_good, jump_run = measured, (t, measured), 0
+
+            if not math.isnan(raw):
                 raw_stats.add(t, raw)
                 if zero_samples is not None:
                     if t <= args.auto_zero:
@@ -357,38 +437,52 @@ def main():
                         zero_samples = None
             else:
                 missed += 1
+                pivot = bob = None
 
             mean_raw, std = raw_stats.mean_std()
             angle, mean = raw - zero, mean_raw - zero
 
             if writer:
-                writer.writerow([f"{t:.4f}", f"{raw:.3f}", f"{angle:.3f}", f"{mean:.3f}", f"{std:.3f}",
-                                 int(pivot is not None), how])
+                writer.writerow([f"{t:.4f}", f"{measured:.3f}", f"{angle:.3f}", f"{mean:.3f}", f"{std:.3f}",
+                                 int(not math.isnan(raw)), how])
 
             now = time.time()
             fps_est = 0.9 * fps_est + 0.1 / max(now - last_tick, 1e-6)
             last_tick = now
 
             if display:
-                lines = [f"angle {angle:+6.2f} deg ({how})" if pivot is not None else "markers not found",
+                lines = [f"angle {angle:+6.2f} deg ({how})" if not math.isnan(raw) else f"no angle this frame ({how})",
                          f"mean {mean:+6.2f} +/- {std:.2f} deg ({args.window:g} s)",
                          f"zero {zero:+.2f} deg   {fps_est:4.1f} fps"]
                 if args.speed_k and not math.isnan(mean):
                     v = args.speed_k * math.sqrt(max(math.tan(math.radians(abs(mean))), 0.0))
                     lines.append(f"speed ~ {v:.2f} m/s")
+                if args.debug:
+                    clipped = float((gray >= 250).mean())
+                    lines.append(f"brightness {gray.mean():.0f}/255, clipped {clipped:.0%}")
+                    if detect_tags:
+                        seen = [] if ids is None else sorted(int(i) for i in ids.flatten())
+                        lines.append(f"tags seen {seen}, failed candidates {len(rejected)}")
                 view = frame.copy()
+                if args.debug and rejected is not None and len(rejected):
+                    cv2.aruco.drawDetectedMarkers(view, rejected, borderColor=(0, 0, 255))
                 if ids is not None and len(ids):
                     cv2.aruco.drawDetectedMarkers(view, corners, ids)
                 draw(view, pivot, bob, zero, lines)
                 cv2.imshow("pendulum", view)
                 if args.tune:
                     cv2.imshow("tune", mask)
+                elif args.debug and mask is not None:
+                    cv2.imshow("mask", mask)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
                 if key == ord("z") and not math.isnan(mean_raw):
                     zero = mean_raw
                     print(f"Zero set to {zero:.2f} deg (pass --zero {zero:.2f} next time)")
+                if key == ord("e") and hasattr(source, "relock"):
+                    print("Measuring exposure again...")
+                    source.relock()
                 if key == ord("s"):
                     name = f"snapshot_{int(time.time())}.png"
                     cv2.imwrite(name, view)
@@ -401,7 +495,9 @@ def main():
             cv2.destroyAllWindows()
         if args.tune:
             print(f"--hsv-low {lo[0]},{lo[1]},{lo[2]} --hsv-high {hi[0]},{hi[1]},{hi[2]}")
-        print(f"{frames} frames, markers missed in {missed}")
+        print(f"{frames} frames, no angle in {missed}"
+              + (f", single-tag rotation used in {fallbacks}" if detect_tags else "")
+              + f", jumps rejected {jumps}")
         if frames == 0:
             print("No frames were read. If this was a video file, check that it plays and is not empty.")
 
